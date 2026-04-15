@@ -1,1 +1,1396 @@
 
+#include <Wire.h>
+#include <MPU6050.h>
+#include <TinyGPSPlus.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebSocketsClient.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
+
+// =====================================================================
+// KHAI BÁO CHÂN GPIO
+// =====================================================================
+
+#define SIM_RX 16
+#define SIM_TX 17
+HardwareSerial simSerial(1);
+
+#define GPS_RX 26
+#define GPS_TX 27
+HardwareSerial gpsSerial(2);
+TinyGPSPlus gps;
+
+#define MPU_SDA 21
+#define MPU_SCL 22
+MPU6050 mpu;
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+#define BUTTON_SOS 25
+#define BUTTON_FORGET_TOGGLE 32
+
+#define FORCE_SENSOR_PIN 34
+
+#define BUZZER_PIN 13
+
+#define LED_STATUS 2
+#define LED_FORGET_MODE 33
+#define LED_GPS_STATUS 4
+
+// =====================================================================
+// CẤU HÌNH HỆ THỐNG
+// =====================================================================
+
+const char* WIFI_SSID = "vippro";
+const char* WIFI_PASSWORD = "12346789";
+const char* DEVICE_TOKEN = "IOT-UH95-VIWZ";
+const char* GPS_SERVER_URL = "http://35.186.145.70:8080/api/device/location";
+const unsigned long GPS_SEND_INTERVAL = 5000;
+
+#define FSR_THRESHOLD 3500
+#define NO_TOUCH_TIMEOUT 5000
+
+#define FREEFALL_THRESHOLD 0.4
+#define IMPACT_THRESHOLD 1.5
+#define FALL_ANGLE_THRESHOLD 65
+#define FALL_CONFIRM_TIME 2000
+#define FALL_PRE_ALERT_TIME 5000  // NEW: 5 giây cảnh báo trước
+#define DEBOUNCE_DELAY 200
+
+#define OBSTACLE_CRITICAL 30
+#define OBSTACLE_WARNING 50
+#define OBSTACLE_SAFE 100
+
+const char* EMERGENCY_PHONE = "+84332710154";
+const char* SIM_SERVER_URL = "http://your-server.com/api/alerts";
+const char* JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...";
+
+// SNTP Configuration
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = 7 * 3600; // GMT+7
+const int DAYLIGHT_OFFSET_SEC = 0;
+// Tọa độ giả lập demo (Lăng Bác)
+const float MOCK_LAT = 20.981215;
+const float MOCK_LNG =  105.786688;
+
+// =====================================================================
+// MOVING AVERAGE FILTER
+// =====================================================================
+
+#define FILTER_WINDOW_SIZE 3
+
+class MovingAverageFilter {
+private:
+  float buffer[FILTER_WINDOW_SIZE];
+  int index;
+  int count;
+  float sum;
+  
+public:
+  MovingAverageFilter() : index(0), count(0), sum(0) {
+    for (int i = 0; i < FILTER_WINDOW_SIZE; i++) {
+      buffer[i] = 0;
+    }
+  }
+  
+  float update(float newValue) {
+    sum -= buffer[index];
+    buffer[index] = newValue;
+    sum += newValue;
+    
+    index = (index + 1) % FILTER_WINDOW_SIZE;
+    if (count < FILTER_WINDOW_SIZE) count++;
+    
+    return sum / count;
+  }
+  
+  void reset() {
+    index = 0;
+    count = 0;
+    sum = 0;
+    for (int i = 0; i < FILTER_WINDOW_SIZE; i++) {
+      buffer[i] = 0;
+    }
+  }
+};
+
+MovingAverageFilter accelFilter;
+MovingAverageFilter distanceFilter;
+
+// =====================================================================
+// BIẾN TOÀN CỤC
+// =====================================================================
+
+Preferences preferences;
+WebSocketsClient webSocket;
+
+bool wifiConnected = false;
+bool wsConnected = false;
+bool gpsValid = false;
+bool sntpSynced = false;
+
+volatile bool sosTriggered = false;
+volatile unsigned long lastSOSPress = 0;
+volatile bool toggleTriggered = false;
+volatile unsigned long lastTogglePress = 0;
+volatile bool sosProcessing = false;
+volatile bool toggleProcessing = false;
+
+bool forgetModeEnabled = true;
+unsigned long lastTouchTime = 0;
+bool userHolding = false;
+bool forgetAlertSent = false;
+
+// =====================================================================
+// FINITE STATE MACHINE - FALL DETECTION (IMPROVED)
+// =====================================================================
+
+enum FallState {
+  FALL_IDLE,
+  FALL_FREEFALL,
+  FALL_IMPACT,
+  FALL_PRE_ALERT,      // NEW: Cảnh báo 5s trước khi gửi SMS
+  FALL_WAIT_CONFIRM,
+  FALL_CONFIRMED
+};
+
+FallState fallState = FALL_IDLE;
+unsigned long fallStateStartTime = 0;
+bool fallCancelled = false;
+
+bool fallDetected = false;
+unsigned long fallStartTime = 0;
+bool fallAlertSent = false;
+
+unsigned long lastObstacleBeep = 0;
+int currentObstacleLevel = 0;
+
+float latitude = 0.0;
+float longitude = 0.0;
+float gpsSpeed = 0.0;
+int gpsSatellites = 0;
+unsigned long lastGPSSend = 0;
+
+// =====================================================================
+// SIM7600 STATE MACHINE (NON-BLOCKING)
+// =====================================================================
+
+enum SIMState {
+  SIM_IDLE,
+  SIM_SENDING_SMS_INIT,
+  SIM_SENDING_SMS_NUMBER,
+  SIM_SENDING_SMS_CONTENT,
+  SIM_SENDING_SMS_WAIT,
+  SIM_SENDING_HTTP_INIT,
+  SIM_SENDING_HTTP_CONFIG,
+  SIM_SENDING_HTTP_DATA,
+  SIM_SENDING_HTTP_ACTION,
+  SIM_SENDING_HTTP_TERM,
+  SIM_CALLING_INIT,
+  SIM_CALLING_WAIT,
+  SIM_BUSY
+};
+
+SIMState simState = SIM_IDLE;
+unsigned long simStateStartTime = 0;
+String simPendingData = "";
+bool simSOSPriority = false;
+
+// =====================================================================
+// UART BINARY PROTOCOL
+// =====================================================================
+
+#define UART_S3_BAUD 115200
+#define UART_SEND_INTERVAL 2000
+#define PACKET_START_BYTE 0xAA
+#define PACKET_END_BYTE 0x55
+
+enum MotionStatus {
+  MOTION_STOPPED = 0,
+  MOTION_WALKING = 1,
+  MOTION_FAST_WALKING = 2,
+  MOTION_DRIVING = 3
+};
+
+enum PacketType {
+  PACKET_GPS_LOCATION = 0x01,
+  PACKET_STATUS_UPDATE = 0x02,
+  PACKET_FORGET_ALERT = 0x03,
+  PACKET_FALL_ALERT = 0x04
+};
+
+struct __attribute__((packed)) GPSLocationPacket {
+  uint8_t startByte;
+  uint8_t packetType;
+  uint8_t packetSize;
+  float latitude;
+  float longitude;
+  float speed;
+  uint8_t satellites;
+  uint8_t gpsValid;
+  uint32_t timestamp;
+  uint8_t checksum;
+  uint8_t endByte;
+};
+
+struct __attribute__((packed)) StatusUpdatePacket {
+  uint8_t startByte;
+  uint8_t packetType;
+  uint8_t packetSize;
+  uint8_t sosActive;
+  uint8_t userHolding;
+  uint8_t forgetMode;
+  uint8_t motionStatus;
+  int8_t wifiRSSI;
+  uint8_t batteryLevel;
+  uint32_t timestamp;
+  uint8_t checksum;
+  uint8_t endByte;
+};
+
+struct __attribute__((packed)) AlertPacket {
+  uint8_t startByte;
+  uint8_t packetType;
+  uint8_t packetSize;
+  float latitude;
+  float longitude;
+  uint8_t gpsValid;
+  char message[16];
+  uint32_t timestamp;
+  uint8_t checksum;
+  uint8_t endByte;
+};
+
+bool sosActive = false;
+
+// =====================================================================
+// BUZZER PATTERNS
+// =====================================================================
+
+enum BuzzerPattern {
+  BUZZER_OFF,
+  BUZZER_SOS,
+  BUZZER_FALL,
+  BUZZER_FALL_PRE_ALERT,  // NEW: Bíp cảnh báo trước
+  BUZZER_FORGET,
+  BUZZER_OBSTACLE_CRITICAL,
+  BUZZER_OBSTACLE_WARNING,
+  BUZZER_CONFIRM_ON,
+  BUZZER_CONFIRM_OFF
+};
+
+volatile BuzzerPattern currentPattern = BUZZER_OFF;
+unsigned long lastBuzzerToggle = 0;
+bool buzzerState = false;
+
+// =====================================================================
+// FREERTOS - MUTEX & QUEUES
+// =====================================================================
+
+SemaphoreHandle_t wifiMutex;
+SemaphoreHandle_t i2cMutex;
+SemaphoreHandle_t simMutex;
+SemaphoreHandle_t gpsMutex;
+SemaphoreHandle_t uartMutex;
+
+QueueHandle_t sosQueue;
+QueueHandle_t buttonEventQueue;
+
+struct ButtonEvent {
+  uint8_t buttonType;  // 0 = SOS, 1 = Toggle, 2 = Cancel Fall
+  unsigned long timestamp;
+};
+
+// =====================================================================
+// FORWARD DECLARATIONS
+// =====================================================================
+
+void blinkLED(int pin, int times, int delayMs);
+void initSIM7600();
+void setupHardware();
+void connectWiFi();
+void syncSNTP();
+void handleButtons();
+void processSafety();
+void detectFall();
+void sendFallSMS();
+void detectObstacle();
+void checkForgetMode();
+void sendForgetAlert();
+void updateGPS();
+void sendGPSLocation();
+void handleSOSEmergency();
+void sendHTTPViaWiFi(String jsonData, const char* url);
+void processSIMStateMachine();
+void controlBuzzer();
+String getRealTimestamp();
+uint8_t calculateChecksum(uint8_t* data, size_t length);
+void sendGPSPacketToS3();
+void sendStatusPacketToS3();
+void sendAlertPacketToS3(PacketType type, const char* msg);
+
+// =====================================================================
+// NGẮT NÚT BẤM (ISR - Chỉ đẩy vào Queue)
+// =====================================================================
+
+void IRAM_ATTR isrSOSButton() {
+  unsigned long now = millis();
+  if ((now - lastSOSPress > DEBOUNCE_DELAY) && !sosProcessing) {
+    ButtonEvent evt = {0, now};
+    xQueueSendFromISR(buttonEventQueue, &evt, NULL);
+    lastSOSPress = now;
+  }
+}
+
+void IRAM_ATTR isrToggleButton() {
+  unsigned long now = millis();
+  if ((now - lastTogglePress > DEBOUNCE_DELAY) && !toggleProcessing) {
+    ButtonEvent evt = {1, now};
+    xQueueSendFromISR(buttonEventQueue, &evt, NULL);
+    lastTogglePress = now;
+  }
+}
+
+// =====================================================================
+// SETUP
+// =====================================================================
+
+void setup() {
+  Serial.begin(UART_S3_BAUD);
+  delay(100);
+  
+  Serial.println("\n\n╔════════════════════════════════════════════════╗");
+  Serial.println("║   GẬY THÔNG MINH ESP32 v3.2 OPTIMIZED         ║");
+  Serial.println("║   GPS Time + Non-blocking SIM + Filters        ║");
+  Serial.println("╚════════════════════════════════════════════════╝\n");
+
+  preferences.begin("smart-cane", false);
+  forgetModeEnabled = preferences.getBool("forgetMode", true);
+  Serial.printf("[CONFIG] Chế độ chống quên: %s\n", forgetModeEnabled ? "BẬT" : "TẮT");
+
+  setupHardware();
+  connectWiFi();
+  
+  wifiMutex = xSemaphoreCreateMutex();
+
+  if (wifiConnected) {
+    syncSNTP();
+  }
+
+  i2cMutex = xSemaphoreCreateMutex();
+  simMutex = xSemaphoreCreateMutex();
+  gpsMutex = xSemaphoreCreateMutex();
+  uartMutex = xSemaphoreCreateMutex();
+  
+  sosQueue = xQueueCreate(5, sizeof(bool));
+  buttonEventQueue = xQueueCreate(10, sizeof(ButtonEvent));
+
+  Serial.println("\n[RTOS] Khởi tạo Tasks...");
+  
+  xTaskCreatePinnedToCore(taskCritical, "Critical_Task", 8192, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(taskCommunication, "Communication_Task", 16384, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(taskGPSTracker, "GPS_Tracker_Task", 12288, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(taskUARTSender, "UART_Sender_Task", 8192, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(taskBuzzer, "Buzzer_Task", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(taskSIMHandler, "SIM_Handler_Task", 12288, NULL, 1, NULL, 0);
+
+  Serial.println("[RTOS] Hệ thống sẵn sàng!\n");
+  blinkLED(LED_STATUS, 3, 200);
+}
+
+// =====================================================================
+// KHỞI TẠO PHẦN CỨNG
+// =====================================================================
+
+void setupHardware() {
+  Wire.begin(MPU_SDA, MPU_SCL);
+  Serial.print("[INIT] MPU6050... ");
+  mpu.initialize();
+  Serial.println(mpu.testConnection() ? "OK" : "FAIL");
+  Wire.setTimeOut(100);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  Serial.println("[INIT] HC-SR05... OK");
+
+  pinMode(FORCE_SENSOR_PIN, INPUT);
+  Serial.println("[INIT] FSR402... OK");
+
+  pinMode(BUTTON_SOS, INPUT_PULLUP);
+  pinMode(BUTTON_FORGET_TOGGLE, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_SOS), isrSOSButton, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_FORGET_TOGGLE), isrToggleButton, FALLING);
+  Serial.println("[INIT] Buttons (ISR → Queue)... OK");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_STATUS, OUTPUT);
+  pinMode(LED_FORGET_MODE, OUTPUT);
+  pinMode(LED_GPS_STATUS, OUTPUT);
+  
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_STATUS, LOW);
+  digitalWrite(LED_FORGET_MODE, forgetModeEnabled ? HIGH : LOW);
+  digitalWrite(LED_GPS_STATUS, LOW);
+  
+  Serial.println("[INIT] Buzzer & LED... OK");
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("[INIT] GPS Neo-6M... OK");
+
+  simSerial.begin(115200, SERIAL_8N1, SIM_RX, SIM_TX);
+  Serial.println("[INIT] SIM7600X... OK");
+  initSIM7600();
+}
+
+void initSIM7600() {
+  Serial.println("[SIM] Đang khởi động module...");
+  delay(5000);
+  
+  simSerial.println("AT");
+  delay(1000);
+  simSerial.println("AT+CPIN?");
+  delay(1000);
+  simSerial.println("AT+CREG?");
+  delay(1000);
+  simSerial.println("AT+CGATT=1");
+  delay(2000);
+  
+  Serial.println("[SIM] Sẵn sàng!");
+}
+
+void connectWiFi() {
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(WIFI_SSID);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\n[WiFi] ✓ Connected!");
+    Serial.print("[WiFi] IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[WiFi] ✗ Failed!");
+    wifiConnected = false;
+  }
+}
+
+// =====================================================================
+// SNTP TIME SYNC
+// =====================================================================
+
+void syncSNTP() {
+  Serial.println("[SNTP] Đang đồng bộ thời gian...");
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  
+  int retries = 0;
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo) && retries < 10) {
+    delay(500);
+    retries++;
+  }
+  
+  if (retries < 10) {
+    sntpSynced = true;
+    Serial.println("[SNTP] ✓ Đồng bộ thành công!");
+    Serial.printf("[SNTP] Thời gian: %02d:%02d:%02d\n", 
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  } else {
+    Serial.println("[SNTP] ✗ Không thể đồng bộ!");
+  }
+}
+
+// =====================================================================
+// REAL TIMESTAMP (GPS → SNTP → millis fallback)
+// =====================================================================
+
+String getRealTimestamp() {
+  char timestamp[30];
+  
+  // Ưu tiên: Sử dụng SNTP Time (Đã config GMT+7)
+  if (sntpSynced) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      // Format: YYYY-MM-DDTHH:MM:SS (Local time, không có Z)
+      strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+      return String(timestamp);
+    }
+  }
+  
+  // Fallback: Sử dụng millis() + tính toán thủ công
+  unsigned long totalSeconds = millis() / 1000;
+  int hours = 7 + ((totalSeconds / 3600) % 24);  // GMT+7
+  int minutes = (totalSeconds / 60) % 60;
+  int seconds = totalSeconds % 60;
+  
+  // Ngày cố định cho demo (NÊN THAY ĐỔI NẾU DÙNG THỰC TẾ)
+  snprintf(timestamp, sizeof(timestamp), 
+           "2025-01-06 %02d:%02d:%02d", hours, minutes, seconds);
+  return String(timestamp);
+}
+
+// =====================================================================
+// TASK 1: CRITICAL (Core 1) - Priority 3
+// =====================================================================
+
+void taskCritical(void *param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t freq = pdMS_TO_TICKS(50);
+
+  for (;;) {
+    handleButtons();
+    processSafety();
+    checkForgetMode();
+    vTaskDelayUntil(&lastWake, freq);
+  }
+}
+
+// =====================================================================
+// XỬ LÝ NÚT BẤM (Queue-based)
+// =====================================================================
+
+void handleButtons() {
+  ButtonEvent evt;
+  
+  while (xQueueReceive(buttonEventQueue, &evt, 0) == pdTRUE) {
+    
+if (evt.buttonType == 0) { // Nút SOS
+    if (!sosActive) { 
+        // LẦN NHẤN ĐẦU TIÊN: Kích hoạt
+        sosActive = true; 
+        currentPattern = BUZZER_SOS;
+        digitalWrite(LED_STATUS, HIGH);
+        
+        // Gọi hàm gửi cảnh báo trực tiếp (hoặc bật flag cho Task)
+        // Không dùng xQueueSend nữa để tránh tích tụ lệnh trong RAM
+        handleSOSEmergency(); 
+        Serial.println("[SOS] Đã gửi cảnh báo duy nhất một lần.");
+    } 
+    else {
+        // ĐANG TRONG TRẠNG THÁI SOS: Kiểm tra nhấn giữ 3s để tắt
+        unsigned long startCheck = millis();
+        bool confirmed = false;
+
+        while (digitalRead(BUTTON_SOS) == LOW) {
+            if (millis() - startCheck >= 3000) {
+                confirmed = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        if (confirmed) {
+            sosActive = false; // Reset trạng thái để có thể gửi lần sau
+            currentPattern = BUZZER_CONFIRM_OFF;
+            digitalWrite(LED_STATUS, LOW);
+            Serial.println("[SOS] ĐÃ TẮT THỦ CÔNG .");
+        }
+    }
+} else if (evt.buttonType == 1) {  // Toggle Button
+      forgetModeEnabled = !forgetModeEnabled;
+      preferences.putBool("forgetMode", forgetModeEnabled);
+      
+      digitalWrite(LED_FORGET_MODE, forgetModeEnabled ? HIGH : LOW);
+      currentPattern = forgetModeEnabled ? BUZZER_CONFIRM_ON : BUZZER_CONFIRM_OFF;
+      
+      Serial.println("\n╔════════════════════════════════════╗");
+      Serial.printf("║  CHỐNG QUÊN: %-22s║\n", forgetModeEnabled ? "BẬT ✓" : "TẮT ✗");
+      Serial.println("╚════════════════════════════════════╝");
+      
+      if (!forgetModeEnabled) {
+        forgetAlertSent = false;
+        lastTouchTime = millis();
+        if (currentPattern == BUZZER_FORGET) {
+          currentPattern = BUZZER_OFF;
+      }
+      }
+      
+      toggleProcessing = true;
+      vTaskDelay(pdMS_TO_TICKS(200));
+      toggleProcessing = false;
+      
+    } else if (evt.buttonType == 2) {  // Cancel Fall Alert
+      if (fallState == FALL_PRE_ALERT) {
+        Serial.println("\n[FALL] ✓ Người dùng hủy cảnh báo té ngã!");
+        fallCancelled = true;
+        fallState = FALL_IDLE;
+        currentPattern = BUZZER_OFF;
+      }
+    }
+  }
+}
+
+// =====================================================================
+// GIÁM SÁT AN TOÀN
+// =====================================================================
+
+void processSafety() {
+  detectFall();
+  detectObstacle();
+}
+
+// =====================================================================
+// PHÁT HIỆN TÉ NGÃ (IMPROVED với PRE_ALERT)
+// =====================================================================
+
+void detectFall() {
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    xSemaphoreGive(i2cMutex);
+
+    if (ax == 0 && ay == 0 && az == 0) {
+      Serial.println("[I2C] Bus Hang detected! Resetting...");
+      Wire.begin(MPU_SDA, MPU_SCL); // Khởi động lại I2C
+      mpu.initialize();
+      return;
+    }
+    float accelX = ax / 16384.0;
+    float accelY = ay / 16384.0;
+    float accelZ = az / 16384.0;
+    float rawAccel = sqrt(accelX*accelX + accelY*accelY + accelZ*accelZ);
+    
+    // Áp dụng Moving Average Filter
+    float totalAccel = accelFilter.update(rawAccel);
+    
+    float pitch = atan2(accelY, sqrt(accelX*accelX + accelZ*accelZ)) * 180.0 / PI;
+    float roll = atan2(-accelX, accelZ) * 180.0 / PI;
+    float tiltAngle = sqrt(pitch*pitch + roll*roll);
+    
+    unsigned long now = millis();
+    
+    // Kiểm tra nút Cancel trong PRE_ALERT state
+    if (fallState == FALL_PRE_ALERT) {
+      if (digitalRead(BUTTON_SOS) == LOW || digitalRead(BUTTON_FORGET_TOGGLE) == LOW) {
+        ButtonEvent cancelEvt = {2, now};
+        xQueueSend(buttonEventQueue, &cancelEvt, 0);
+      }
+    }
+    
+    switch (fallState) {
+      
+      case FALL_IDLE:
+        if (totalAccel < FREEFALL_THRESHOLD) {
+          fallState = FALL_FREEFALL;
+          fallStateStartTime = now;
+          Serial.println("[FALL FSM] → FREEFALL");
+          Serial.printf("[DEBUG] Gia tốc: %.2fg (filtered)\n", totalAccel);
+        }
+        break;
+      
+      case FALL_FREEFALL:
+        if (totalAccel > IMPACT_THRESHOLD) {
+          fallState = FALL_IMPACT;
+          fallStateStartTime = now;
+          Serial.println("[FALL FSM] → IMPACT");
+          Serial.printf("[DEBUG] Va chạm: %.2fg\n", totalAccel);
+        } 
+        else if ((now - fallStateStartTime) > 500) {
+          Serial.println("[FALL FSM] → IDLE (Timeout)");
+          fallState = FALL_IDLE;
+        }
+        break;
+      
+      case FALL_IMPACT:
+        if (tiltAngle > FALL_ANGLE_THRESHOLD) {
+          fallState = FALL_PRE_ALERT;
+          fallStateStartTime = now;
+          fallCancelled = false;
+          currentPattern = BUZZER_FALL_PRE_ALERT;
+          
+          Serial.println("\n╔════════════════════════════════════╗");
+          Serial.println("║  ⚠️  CẢNH BÁO TÉ NGÃ (5s)  ⚠️      ║");
+          Serial.println("║  Nhấn NÚT BẤT KỲ để HỦY!          ║");
+          Serial.println("╚════════════════════════════════════╝");
+          Serial.printf("[DEBUG] Góc: %.1f° - Nhấn nút để hủy!\n", tiltAngle);
+        } else {
+          Serial.println("[FALL FSM] → IDLE (Góc nhỏ)");
+          fallState = FALL_IDLE;
+        }
+        break;
+      
+      case FALL_PRE_ALERT:
+        // Chờ 5 giây, cho phép người dùng hủy
+        if (fallCancelled) {
+          fallState = FALL_IDLE;
+          currentPattern = BUZZER_OFF;
+          Serial.println("[FALL] Đã hủy cảnh báo!");
+        }
+        else if ((now - fallStateStartTime) > FALL_PRE_ALERT_TIME) {
+          fallState = FALL_WAIT_CONFIRM;
+          fallStateStartTime = now;
+          Serial.println("[FALL FSM] → WAIT_CONFIRM (Không hủy)");
+        }
+        break;
+      
+      case FALL_WAIT_CONFIRM:
+        if ((now - fallStateStartTime) > FALL_CONFIRM_TIME) {
+          if (abs(totalAccel - 1.0) < 0.3) {
+            fallState = FALL_CONFIRMED;
+            Serial.println("\n╔════════════════════════════════════╗");
+            Serial.println("║  ⚠️⚠️  XÁC NHẬN TÉ NGÃ  ⚠️⚠️        ║");
+            Serial.println("╚════════════════════════════════════╝");
+            
+            currentPattern = BUZZER_FALL;
+            sendFallSMS();
+            sendAlertPacketToS3(PACKET_FALL_ALERT, "Fall Detected!");
+            
+            bool sosFlag = true;
+            xQueueSend(sosQueue, &sosFlag, 0);
+          } else {
+            Serial.println("[FALL FSM] → IDLE (Đã đứng dậy)");
+            fallState = FALL_IDLE;
+          }
+        }
+        else if (abs(totalAccel - 1.0) > 0.5) {
+          Serial.println("[FALL FSM] → IDLE (Chuyển động)");
+          fallState = FALL_IDLE;
+        }
+        break;
+      
+      case FALL_CONFIRMED:
+        if (abs(totalAccel - 1.0) > 0.5) {
+          Serial.println("[FALL FSM] → IDLE (Hồi phục)");
+          fallState = FALL_IDLE;
+          currentPattern = BUZZER_OFF;
+          fallAlertSent = false;
+          accelFilter.reset();
+        }
+        break;
+    }
+  }
+}
+
+// =====================================================================
+// GỬI SMS TÉ NGÃ (Non-blocking request)
+// =====================================================================
+
+void sendFallSMS() {
+  // Chỉ đánh dấu cờ, Task SIM sẽ xử lý
+  simSOSPriority = true;
+  Serial.println("[SMS] Yêu cầu gửi SMS té ngã (Non-blocking)");
+}
+
+// =====================================================================
+// PHÁT HIỆN VẬT CẢN (với Filter)
+// =====================================================================
+
+void detectObstacle() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  float rawDistance = duration * 0.034 / 2;
+  
+  // Áp dụng Moving Average Filter
+  float distance = distanceFilter.update(rawDistance);
+
+  if (distance > 0 && distance < OBSTACLE_CRITICAL) {
+    if (currentPattern != BUZZER_SOS && currentPattern != BUZZER_FALL 
+        && currentPattern != BUZZER_FALL_PRE_ALERT) {
+      currentPattern = BUZZER_OBSTACLE_CRITICAL;
+    }
+    currentObstacleLevel = 2;
+  } else if (distance >= OBSTACLE_CRITICAL && distance < OBSTACLE_WARNING) {
+    if (currentPattern != BUZZER_SOS && currentPattern != BUZZER_FALL
+        && currentPattern != BUZZER_FALL_PRE_ALERT) {
+      currentPattern = BUZZER_OBSTACLE_WARNING;
+    }
+    currentObstacleLevel = 1;
+  } else {
+    if (currentPattern == BUZZER_OBSTACLE_CRITICAL || 
+        currentPattern == BUZZER_OBSTACLE_WARNING) {
+      currentPattern = BUZZER_OFF;
+    }
+    currentObstacleLevel = 0;
+  }
+}
+
+// =====================================================================
+// KIỂM TRA CHỐNG QUÊN
+// =====================================================================
+
+void checkForgetMode() {
+  if (!forgetModeEnabled) return;
+
+  int fsrValue = analogRead(FORCE_SENSOR_PIN);
+  unsigned long now = millis();
+
+  if (fsrValue < FSR_THRESHOLD) {
+    if (!userHolding) {
+      userHolding = true;
+      forgetAlertSent = false;
+      digitalWrite(LED_STATUS, HIGH);
+      Serial.println("[FSR] ✓ Người dùng cầm gậy");
+      if (currentPattern == BUZZER_FORGET) {
+          currentPattern = BUZZER_OFF;
+      }
+    }
+    lastTouchTime = now;
+  } else {
+    if (userHolding) {
+      userHolding = false;
+      digitalWrite(LED_STATUS, LOW);
+      Serial.println("[FSR] ⚠️ Người dùng đã thả gậy");
+    }
+    
+    unsigned long timeWithoutTouch = now - lastTouchTime;
+    
+    if (timeWithoutTouch > NO_TOUCH_TIMEOUT && !forgetAlertSent) {
+      Serial.println("\n╔════════════════════════════════════╗");
+      Serial.println("║  ⚠️  GẬY CÓ THỂ BỊ BỎ QUÊN!  ⚠️   ║");
+      Serial.println("╚════════════════════════════════════╝");
+      
+      forgetAlertSent = true;
+      currentPattern = BUZZER_FORGET;
+      sendAlertPacketToS3(PACKET_FORGET_ALERT, "Cane Forgotten!");
+      sendForgetAlert();
+    }
+  }
+}
+
+void sendForgetAlert() {
+  Serial.println("[FORGET] Đang gửi cảnh báo...");
+  
+  StaticJsonDocument<256> doc;
+  doc["type"] = "forget_alert";
+  doc["deviceToken"] = DEVICE_TOKEN;
+  doc["lat"] = latitude;
+  doc["lng"] = longitude;
+  doc["timestamp"] = getRealTimestamp();
+  doc["message"] = "Gậy có thể bị bỏ quên";
+  
+  String json;
+  serializeJson(doc, json);
+  
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    sendHTTPViaWiFi(json, GPS_SERVER_URL);
+  }
+}
+
+// =====================================================================
+// TASK 2: COMMUNICATION (Core 0) - Priority 1
+// =====================================================================
+
+void taskCommunication(void *param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t freq = pdMS_TO_TICKS(1000);
+
+  for (;;) {
+    updateGPS();
+    
+    bool sosFlag;
+    if (xQueueReceive(sosQueue, &sosFlag, 0) == pdTRUE) {
+      handleSOSEmergency();
+    }
+
+    vTaskDelayUntil(&lastWake, freq);
+  }
+}
+
+// =====================================================================
+// CẬP NHẬT GPS
+// =====================================================================
+
+void updateGPS() {
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (gps.location.isValid()) {
+          latitude = gps.location.lat();
+          longitude = gps.location.lng();
+          gpsSpeed = gps.speed.kmph();
+          gpsSatellites = gps.satellites.value();
+          gpsValid = true;
+          digitalWrite(LED_GPS_STATUS, HIGH);
+        } else {
+          gpsValid = false;
+          digitalWrite(LED_GPS_STATUS, LOW);
+        }
+        xSemaphoreGive(gpsMutex);
+      }
+    }
+  }
+}
+
+// =====================================================================
+// TASK 3: GPS TRACKER (Core 0) - Priority 2
+// =====================================================================
+
+void taskGPSTracker(void *param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t freq = pdMS_TO_TICKS(GPS_SEND_INTERVAL);
+
+  for (;;) {
+    // Dừng gửi GPS nếu SOS đang diễn ra
+    if (!simSOSPriority && wifiConnected && WiFi.status() == WL_CONNECTED ) {
+      sendGPSLocation();
+    }
+
+    vTaskDelayUntil(&lastWake, freq);
+  }
+}
+
+// =====================================================================
+// GỬI GPS LOCATION QUA WiFi
+// =====================================================================
+
+void sendGPSLocation() {
+  if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    StaticJsonDocument<512> doc;
+    doc["deviceToken"] = DEVICE_TOKEN;
+    doc["timestamp"] = getRealTimestamp();
+    
+    JsonObject gpsObj = doc.createNestedObject("gps");
+    if (gpsValid) {
+      gpsObj["latitude"] = latitude;
+      gpsObj["longitude"] = longitude;
+      gpsObj["speed"] = gpsSpeed;
+      gpsObj["satellites"] = gpsSatellites;
+      gpsObj["type"] = "REAL"; // Gắn tag để bạn biết là tọa độ thật
+    } else {
+      gpsObj["latitude"] = MOCK_LAT;
+      gpsObj["longitude"] = MOCK_LNG;
+      gpsObj["speed"] = 0.0;
+      gpsObj["satellites"] = 0;
+      gpsObj["type"] = "DEMO"; // Gắn tag để biết là tọa độ giả lập
+    }
+    
+    JsonObject network = doc.createNestedObject("network");
+    network["type"] = "wifi";
+    network["signalStrength"] = WiFi.RSSI();
+    
+    JsonObject status = doc.createNestedObject("status");
+    status["sos"] = sosActive;
+    status["lost"] = !userHolding && forgetModeEnabled;
+    
+    if (gpsSpeed < 1.0) {
+      status["motion"] = "STOPPED";
+    } else if (gpsSpeed < 5.0) {
+      status["motion"] = "WALKING";
+    } else if (gpsSpeed < 15.0) {
+      status["motion"] = "FAST_WALKING";
+    } else {
+      status["motion"] = "DRIVING";
+    }
+    
+    xSemaphoreGive(gpsMutex);
+    
+    String jsonOutput;
+    serializeJson(doc, jsonOutput);
+    
+    sendHTTPViaWiFi(jsonOutput, GPS_SERVER_URL);
+  }
+}
+
+// =====================================================================
+// TASK 4: UART SENDER (Core 0) - Priority 2
+// =====================================================================
+
+void taskUARTSender(void *param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t freq = pdMS_TO_TICKS(UART_SEND_INTERVAL);
+
+  for (;;) {
+    if (gpsValid) {
+      sendGPSPacketToS3();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      sendStatusPacketToS3();
+    }
+
+    vTaskDelayUntil(&lastWake, freq);
+  }
+}
+
+// =====================================================================
+// TASK 5: SIM HANDLER (Core 0) - Priority 1 (Non-blocking)
+// =====================================================================
+
+void taskSIMHandler(void *param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t freq = pdMS_TO_TICKS(100);
+
+  for (;;) {
+    processSIMStateMachine();
+    vTaskDelayUntil(&lastWake, freq);
+  }
+}
+
+// =====================================================================
+// SIM STATE MACHINE (NON-BLOCKING)
+// =====================================================================
+
+void processSIMStateMachine() {
+  // Kiểm tra timeout (tránh deadlock)
+  unsigned long now = millis();
+  if (simState != SIM_IDLE && (now - simStateStartTime) > 30000) {
+    Serial.println("[SIM] ⚠️ Timeout! Reset state");
+    simState = SIM_IDLE;
+    if (xSemaphoreTake(simMutex, 0) == pdTRUE) {
+      xSemaphoreGive(simMutex);
+    }
+    return;
+  }
+  
+  switch (simState) {
+    case SIM_IDLE:
+      // Nếu có SOS priority, xử lý ngay
+      if (simSOSPriority) {
+        if (xSemaphoreTake(simMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          Serial.println("[SIM] → SENDING_SMS_INIT (SOS)");
+          simSerial.println("AT+CMGF=1");
+          simState = SIM_SENDING_SMS_INIT;
+          simStateStartTime = now;
+        }
+      }
+      break;
+      
+    case SIM_SENDING_SMS_INIT:
+      if ((now - simStateStartTime) > 1000) {
+        Serial.println("[SIM] → SENDING_SMS_NUMBER");
+        simSerial.print("AT+CMGS=\"");
+        simSerial.print(EMERGENCY_PHONE);
+        simSerial.println("\"");
+        simState = SIM_SENDING_SMS_NUMBER;
+        simStateStartTime = now;
+      }
+      break;
+      
+    case SIM_SENDING_SMS_NUMBER:
+      if ((now - simStateStartTime) > 1000) {
+        Serial.println("[SIM] → SENDING_SMS_CONTENT");
+        
+        char smsContent[200];
+        if (fallState == FALL_CONFIRMED) {
+          snprintf(smsContent, sizeof(smsContent),
+                   "CANH BAO TE NGA!\nNguoi dung da te.\nVi tri: https://maps.google.com/?q=%.6f,%.6f",
+                   latitude, longitude);
+        } else {
+          snprintf(smsContent, sizeof(smsContent),
+                   "CANH BAO KHAN CAP!\nNguoi dung can giup do.\nVi tri: https://maps.google.com/?q=%.6f,%.6f",
+                   latitude, longitude);
+        }
+        
+        simSerial.print(smsContent);
+        simSerial.write(26);
+        simState = SIM_SENDING_SMS_WAIT;
+        simStateStartTime = now;
+      }
+      break;
+      
+    case SIM_SENDING_SMS_WAIT:
+      if ((now - simStateStartTime) > 5000) {
+        while(simSerial.available()) simSerial.read();
+        Serial.println("[SIM] ✓ SMS Sent!");
+        simState = SIM_IDLE;
+        simSOSPriority = false;
+        xSemaphoreGive(simMutex);
+      }
+      break;
+      
+    default:
+      simState = SIM_IDLE;
+      break;
+  }
+}
+
+// =====================================================================
+// XỬ LÝ SOS KHẨN CẤP
+// =====================================================================
+
+void handleSOSEmergency() {
+  Serial.println("\n[SOS] ═══ BẮT ĐẦU CHUỖI KHẨN CẤP ═══");
+  
+  // Đánh dấu SOS priority để Task SIM xử lý
+  simSOSPriority = true;
+  sosActive = true;
+  
+  // Gửi HTTP Alert qua WiFi (không chờ SIM)
+  if (wifiConnected) {
+    StaticJsonDocument<256> doc;
+    doc["type"] = "sos_emergency";
+    doc["deviceToken"] = DEVICE_TOKEN;
+    doc["lat"] = latitude;
+    doc["lng"] = longitude;
+    doc["timestamp"] = getRealTimestamp();
+    doc["priority"] = "critical";
+    
+    String json;
+    serializeJson(doc, json);
+    sendHTTPViaWiFi(json, GPS_SERVER_URL);
+  }
+  
+  sendAlertPacketToS3(PACKET_FALL_ALERT, "SOS Emergency!");
+  
+  Serial.println("[SOS] ✓ Alert sent via WiFi");
+  Serial.println("[SOS] Task SIM đang xử lý SMS...");
+}
+
+// =====================================================================
+// GỬI HTTP QUA WIFI
+// =====================================================================
+
+void sendHTTPViaWiFi(String jsonData, const char* url) {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        WiFiClient client; 
+        
+        http.begin(client, url);
+        
+        // --- PHẦN CẦN THÊM VÀO ---
+        http.addHeader("Content-Type", "application/json");
+        
+        // Thêm Authorization để sửa lỗi 403
+        String authHeader = "Bearer " + String(DEVICE_TOKEN);
+        http.addHeader("Authorization", authHeader);
+        
+        // Thêm User-Agent để tránh bị Nginx chặn
+        http.addHeader("User-Agent", "ESP32-Smart-Cane-V3.2");
+        // -------------------------
+        
+        int httpCode = http.POST(jsonData);
+        
+        if (httpCode > 0) {
+            Serial.printf("[HTTP] Thanh cong, ma phan hoi: %d\n", httpCode);
+            String payload = http.getString();
+            Serial.println(payload);
+        } else {
+            Serial.printf("[HTTP] That bai, loi: %s\n", http.errorToString(httpCode).c_str());
+        }
+        http.end();
+    }
+}
+
+// =====================================================================
+// TASK 6: BUZZER CONTROL (Core 1) - Priority 2
+// =====================================================================
+
+void taskBuzzer(void *param) {
+  for (;;) {
+    controlBuzzer();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// =====================================================================
+// ĐIỀU KHIỂN BUZZER
+// =====================================================================
+
+void controlBuzzer() {
+  unsigned long now = millis();
+  
+  switch (currentPattern) {
+    case BUZZER_OFF:
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerState = false;
+      break;
+      
+    case BUZZER_SOS:
+    case BUZZER_FALL:
+      if (now - lastBuzzerToggle > 200) {
+        buzzerState = !buzzerState;
+        digitalWrite(BUZZER_PIN, buzzerState);
+        lastBuzzerToggle = now;
+      }
+      break;
+      
+    case BUZZER_FALL_PRE_ALERT:
+      // Bíp nhanh 150ms để cảnh báo
+      if (now - lastBuzzerToggle > 150) {
+        buzzerState = !buzzerState;
+        digitalWrite(BUZZER_PIN, buzzerState);
+        lastBuzzerToggle = now;
+      }
+      break;
+      
+    case BUZZER_FORGET:
+      if (buzzerState && (now - lastBuzzerToggle > 1000)) {
+        buzzerState = false;
+        digitalWrite(BUZZER_PIN, LOW);
+        lastBuzzerToggle = now;
+      } else if (!buzzerState && (now - lastBuzzerToggle > 500)) {
+        buzzerState = true;
+        digitalWrite(BUZZER_PIN, HIGH);
+        lastBuzzerToggle = now;
+      }
+      break;
+      
+    case BUZZER_OBSTACLE_CRITICAL:
+      if (now - lastBuzzerToggle > 100) {
+        buzzerState = !buzzerState;
+        digitalWrite(BUZZER_PIN, buzzerState);
+        lastBuzzerToggle = now;
+      }
+      break;
+      
+    case BUZZER_OBSTACLE_WARNING:
+      if (now - lastBuzzerToggle > 300) {
+        buzzerState = !buzzerState;
+        digitalWrite(BUZZER_PIN, buzzerState);
+        lastBuzzerToggle = now;
+      }
+      break;
+      
+    case BUZZER_CONFIRM_ON:
+      digitalWrite(BUZZER_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(100));
+      digitalWrite(BUZZER_PIN, LOW);
+      currentPattern = BUZZER_OFF;
+      break;
+      
+    case BUZZER_CONFIRM_OFF:
+      for (int i = 0; i < 2; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        digitalWrite(BUZZER_PIN, LOW);
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+      currentPattern = BUZZER_OFF;
+      break;
+  }
+}
+
+// =====================================================================
+// UART BINARY PROTOCOL - HELPER FUNCTIONS
+// =====================================================================
+
+uint8_t calculateChecksum(uint8_t* data, size_t length) {
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < length; i++) {
+    checksum ^= data[i];
+  }
+  return checksum;
+}
+
+void sendGPSPacketToS3() {
+  if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    GPSLocationPacket packet;
+    packet.startByte = PACKET_START_BYTE;
+    packet.packetType = PACKET_GPS_LOCATION;
+    packet.packetSize = sizeof(packet) - 4;
+    
+    packet.latitude = latitude;
+    packet.longitude = longitude;
+    packet.speed = gpsSpeed;
+    packet.satellites = gpsSatellites;
+    packet.gpsValid = gpsValid ? 1 : 0;
+    packet.timestamp = millis();
+    
+    packet.checksum = calculateChecksum(
+      ((uint8_t*)&packet) + 1, 
+      sizeof(packet) - 3
+    );
+    
+    packet.endByte = PACKET_END_BYTE;
+    
+    Serial.write((uint8_t*)&packet, sizeof(packet));
+    Serial.flush();
+    
+    xSemaphoreGive(uartMutex);
+  }
+}
+
+void sendStatusPacketToS3() {
+  if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    StatusUpdatePacket packet;
+    packet.startByte = PACKET_START_BYTE;
+    packet.packetType = PACKET_STATUS_UPDATE;
+    packet.packetSize = sizeof(packet) - 4;
+    
+    packet.sosActive = sosActive ? 1 : 0;
+    packet.userHolding = userHolding ? 1 : 0;
+    packet.forgetMode = forgetModeEnabled ? 1 : 0;
+    
+    if (gpsSpeed < 1.0) {
+      packet.motionStatus = MOTION_STOPPED;
+    } else if (gpsSpeed < 5.0) {
+      packet.motionStatus = MOTION_WALKING;
+    } else if (gpsSpeed < 15.0) {
+      packet.motionStatus = MOTION_FAST_WALKING;
+    } else {
+      packet.motionStatus = MOTION_DRIVING;
+    }
+    
+    packet.wifiRSSI = wifiConnected ? WiFi.RSSI() : -100;
+    packet.batteryLevel = 85;
+    packet.timestamp = millis();
+    
+    packet.checksum = calculateChecksum(
+      ((uint8_t*)&packet) + 1,
+      sizeof(packet) - 3
+    );
+    
+    packet.endByte = PACKET_END_BYTE;
+    
+    Serial.write((uint8_t*)&packet, sizeof(packet));
+    Serial.flush();
+    
+    xSemaphoreGive(uartMutex);
+  }
+}
+
+void sendAlertPacketToS3(PacketType type, const char* msg) {
+  if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    AlertPacket packet;
+    packet.startByte = PACKET_START_BYTE;
+    packet.packetType = type;
+    packet.packetSize = sizeof(packet) - 4;
+    
+    packet.latitude = latitude;
+    packet.longitude = longitude;
+    packet.gpsValid = gpsValid ? 1 : 0;
+    
+    strncpy(packet.message, msg, 15);
+    packet.message[15] = '\0';
+    
+    packet.timestamp = millis();
+    
+    packet.checksum = calculateChecksum(
+      ((uint8_t*)&packet) + 1,
+      sizeof(packet) - 3
+    );
+    
+    packet.endByte = PACKET_END_BYTE;
+    
+    Serial.write((uint8_t*)&packet, sizeof(packet));
+    Serial.flush();
+    
+    xSemaphoreGive(uartMutex);
+  }
+}
+
+// =====================================================================
+// UTILITY FUNCTIONS
+// =====================================================================
+
+void blinkLED(int pin, int times, int delayMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(pin, HIGH);
+    delay(delayMs);
+    digitalWrite(pin, LOW);
+    delay(delayMs);
+  }
+}
+
+// =====================================================================
+// LOOP
+// =====================================================================
+
+void loop() {
+  vTaskDelete(NULL);
+}
